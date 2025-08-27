@@ -5,5 +5,5 @@ import react from '@vitejs/plugin-react'
 // For user site (yourusername.github.io): set base to '/'
 export default defineConfig({
   plugins: [react()],
-  base: '/REPO_NAME_HERE/'
+  base: '/ScholarOS/'
 })
