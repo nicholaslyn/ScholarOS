@@ -1,0 +1,709 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import { BookOpen, CheckCircle2, CircleHelp, Database, Download, FileText, LineChart as LineChartIcon, Link as LinkIcon, ListChecks, Loader2, Network, Plus, RefreshCw, Save, Search, Settings, Sparkles, Upload, X } from "lucide-react";
+import { LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip as ReTooltip, ResponsiveContainer, BarChart, Bar, PieChart, Pie } from "recharts";
+import { marked } from "marked";
+import DOMPurify from "dompurify";
+import Papa from "papaparse";
+import * as d3 from "d3";
+import { v4 as uuidv4 } from "uuid";
+
+// =============================================================
+// Scholar OS — All‑in‑One Research/Study Workspace (Client‑only)
+// Features: Notes (Markdown + backlinks), Kanban Tasks, Flashcards (SM-2),
+// Data Explorer (CSV→Charts), Knowledge Graph, Dashboard, Search, JSON import/export.
+// Storage: localStorage. No backend required.
+// =============================================================
+
+// ---------- Utilities ----------
+const nowISO = () => new Date().toISOString();
+const formatDate = (d) => new Date(d).toLocaleString();
+const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
+
+function useLocalState(key, initial) {
+  const [state, setState] = useState(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : (typeof initial === "function" ? initial() : initial);
+    } catch {
+      return typeof initial === "function" ? initial() : initial;
+    }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(key, JSON.stringify(state)); } catch {}
+  }, [key, state]);
+  return [state, setState];
+}
+
+function tagify(text) {
+  const tagSet = new Set((text.match(/#[a-zA-Z0-9_\-]+/g) || []).map(t => t.slice(1).toLowerCase()));
+  return Array.from(tagSet);
+}
+
+function extractLinks(text) {
+  // [[Note Title]] style links
+  const matches = text.match(/\[\[([^\]]+)\]\]/g) || [];
+  return matches.map(m => m.slice(2, -2));
+}
+
+// Simple SM-2 scheduling for flashcards
+function scheduleCard(card, quality /* 0..3 */) {
+  let { ease = 2.5, interval = 0, reps = 0 } = card;
+  if (quality < 2) {
+    reps = 0; interval = 1; // reset
+  } else {
+    reps += 1;
+    if (reps === 1) interval = 1;
+    else if (reps === 2) interval = 6;
+    else interval = Math.round(interval * ease);
+    ease = ease + (0.1 - (3 - quality) * (0.08 + (3 - quality) * 0.02));
+    ease = clamp(ease, 1.3, 3.0);
+  }
+  const due = new Date();
+  due.setDate(due.getDate() + interval);
+  return { ...card, ease, interval, reps, due: due.toISOString(), updatedAt: nowISO() };
+}
+
+function download(filename, text) {
+  const blob = new Blob([text], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ---------- Starter Data ----------
+const starter = () => ({
+  notes: [
+    { id: uuidv4(), title: "Welcome to Scholar OS", content:
+`# Scholar OS
+
+Type notes in **Markdown**. Use #tags and [[Backlinks]] to connect ideas.
+
+- Try creating a few notes and link them with [[Research Plan]].
+- Use the *Tasks* tab to track work in a Kanban.
+- Build flashcards from any note selection.
+- Upload CSVs in *Data* to explore & chart.
+- Open *Graph* to see relationships.
+
+Happy studying! ✨`,
+      tags: ["welcome"], createdAt: nowISO(), updatedAt: nowISO() },
+    { id: uuidv4(), title: "Research Plan", content:
+`## Spring Project
+- Do a literature review on molecular motors
+- Extract key quotes and make flashcards
+- Plot experimental data in Data Explorer
+
+See also: [[Welcome to Scholar OS]]`,
+      tags: ["plan"], createdAt: nowISO(), updatedAt: nowISO() }
+  ],
+  tasks: [
+    { id: uuidv4(), title: "Skim 5 papers", status: "todo", priority: 2, createdAt: nowISO() },
+    { id: uuidv4(), title: "Draft introduction", status: "doing", priority: 3, createdAt: nowISO() },
+    { id: uuidv4(), title: "Set up dataset", status: "done", priority: 1, createdAt: nowISO() }
+  ],
+  decks: [
+    { id: uuidv4(), name: "Core Concepts", cards: [
+      { id: uuidv4(), front: "What does SM-2 schedule?", back: "Spaced repetition intervals based on recall quality.", ease: 2.5, interval: 0, reps: 0, due: nowISO(), createdAt: nowISO(), updatedAt: nowISO() }
+    ] }
+  ],
+  datasets: [],
+  activity: [] // {type:'note|task|review|data', ts}
+});
+
+// ---------- Components ----------
+function TopBar({ query, setQuery, onExport, onImport }) {
+  const fileRef = useRef();
+  return (
+    <div className="flex items-center gap-3 p-3 border-b bg-white/70 dark:bg-zinc-900/70 backdrop-blur sticky top-0 z-40">
+      <Sparkles className="w-6 h-6" />
+      <div className="font-semibold">Scholar OS</div>
+      <div className="flex-1" />
+      <div className="relative max-w-md w-full">
+        <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 opacity-60"/>
+        <input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search notes, tasks, cards…" className="w-full pl-9 pr-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800 focus:outline-none" />
+      </div>
+      <button onClick={onExport} className="px-3 py-2 rounded-xl bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 flex items-center gap-2"><Download className="w-4 h-4"/>Export</button>
+      <button onClick={()=>fileRef.current?.click()} className="px-3 py-2 rounded-xl bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 flex items-center gap-2"><Upload className="w-4 h-4"/>Import</button>
+      <input ref={fileRef} type="file" accept="application/json" className="hidden" onChange={onImport}/>
+    </div>
+  );
+}
+
+function Sidebar({ active, setActive }) {
+  const items = [
+    { id: "dashboard", label: "Dashboard", icon: LineChartIcon },
+    { id: "notes", label: "Notes", icon: BookOpen },
+    { id: "tasks", label: "Tasks", icon: ListChecks },
+    { id: "flash", label: "Flashcards", icon: FileText },
+    { id: "data", label: "Data", icon: Database },
+    { id: "graph", label: "Graph", icon: Network },
+    { id: "about", label: "About", icon: CircleHelp }
+  ];
+  return (
+    <div className="w-56 p-3 border-r bg-white/60 dark:bg-zinc-900/60 backdrop-blur h-full">
+      <div className="text-xs uppercase tracking-widest mb-3 opacity-60">Workspace</div>
+      <div className="flex flex-col gap-1">
+        {items.map(it => (
+          <button key={it.id} onClick={()=>setActive(it.id)} className={`flex items-center gap-2 px-3 py-2 rounded-xl hover:bg-zinc-100 dark:hover:bg-zinc-800 ${active===it.id? 'bg-zinc-100 dark:bg-zinc-800 font-medium' : ''}`}>
+            <it.icon className="w-4 h-4"/>
+            {it.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Dashboard({ state }) {
+  const noteCount = state.notes.length;
+  const taskOpen = state.tasks.filter(t=>t.status!=='done').length;
+  const dueCards = state.decks.flatMap(d=>d.cards).filter(c=>new Date(c.due) <= new Date()).length;
+  const recent = useMemo(()=>{
+    const byDay = {};
+    for (const a of state.activity) {
+      const day = new Date(a.ts).toISOString().slice(0,10);
+      byDay[day] = (byDay[day]||0) + 1;
+    }
+    const days = [...Array(14)].map((_,i)=>{
+      const d = new Date(); d.setDate(d.getDate()-13+i);
+      const key = d.toISOString().slice(0,10);
+      return { day: key.slice(5), actions: byDay[key]||0 };
+    });
+    return days;
+  }, [state.activity]);
+  return (
+    <div className="p-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <Stat title="Notes" value={noteCount} subtitle="Knowledge captured"/>
+      <Stat title="Open tasks" value={taskOpen} subtitle="Things to do"/>
+      <Stat title="Cards due" value={dueCards} subtitle="Study queue"/>
+      <div className="lg:col-span-3 p-4 rounded-2xl border bg-white/50 dark:bg-zinc-900/50">
+        <div className="font-medium mb-2">Activity (last 14 days)</div>
+        <div className="h-48">
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={recent}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="day" />
+              <YAxis allowDecimals={false} />
+              <ReTooltip />
+              <Bar dataKey="actions" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Stat({ title, value, subtitle }) {
+  return (
+    <div className="p-4 rounded-2xl border bg-white/50 dark:bg-zinc-900/50">
+      <div className="text-sm opacity-70">{title}</div>
+      <div className="text-3xl font-semibold">{value}</div>
+      <div className="text-xs opacity-60">{subtitle}</div>
+    </div>
+  );
+}
+
+function Notes({ state, setState, query, onMakeCard }) {
+  const [selected, setSelected] = useState(null);
+  const [raw, setRaw] = useState("");
+  const [title, setTitle] = useState("");
+  const [preview, setPreview] = useState("");
+
+  useEffect(()=>{
+    setPreview(DOMPurify.sanitize(marked.parse(raw || "")));
+  }, [raw]);
+
+  const filtered = useMemo(()=>{
+    const q = query.toLowerCase();
+    return state.notes.filter(n => !q || n.title.toLowerCase().includes(q) || n.content.toLowerCase().includes(q));
+  }, [state.notes, query]);
+
+  function openNote(n){ setSelected(n.id); setRaw(n.content); setTitle(n.title); }
+
+  function saveNote(){
+    setState(s=>{
+      const idx = s.notes.findIndex(n=>n.id===selected);
+      const tags = tagify(raw);
+      const links = extractLinks(raw);
+      const updated = { ...s.notes[idx], title, content: raw, tags, links, updatedAt: nowISO() };
+      const notes = [...s.notes]; notes[idx] = updated;
+      return { ...s, notes, activity: [...s.activity, { type:'note', ts: nowISO() }] };
+    });
+  }
+
+  function createNote(){
+    const n = { id: uuidv4(), title: "Untitled", content: "", tags: [], links: [], createdAt: nowISO(), updatedAt: nowISO() };
+    setState(s=>({ ...s, notes:[n, ...s.notes], activity:[...s.activity, {type:'note', ts:nowISO()}] }));
+    openNote(n);
+  }
+
+  function delNote(id){
+    setState(s=>({ ...s, notes: s.notes.filter(n=>n.id!==id) }));
+    if (selected===id){ setSelected(null); setRaw(""); setTitle(""); }
+  }
+
+  function makeCardFromSelection(){
+    const sel = window.getSelection()?.toString()?.trim();
+    if (!sel) return;
+    onMakeCard(sel);
+  }
+
+  function backlinksFor(n) {
+    const title = n.title;
+    return state.notes.filter(x => x.id!==n.id && (x.content.includes(`[[${title}]]`)));
+  }
+
+  return (
+    <div className="grid grid-cols-12 h-[calc(100vh-64px)]">
+      <div className="col-span-3 border-r p-3 overflow-y-auto">
+        <div className="flex items-center justify-between mb-2">
+          <div className="font-medium">Notes</div>
+          <button onClick={createNote} className="px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 flex items-center gap-1"><Plus className="w-4 h-4"/>New</button>
+        </div>
+        <div className="flex flex-col gap-2">
+          {filtered.map(n => (
+            <button key={n.id} onClick={()=>openNote(n)} className={`text-left p-2 rounded-xl hover:bg-zinc-100 dark:hover:bg-zinc-800 ${selected===n.id? 'bg-zinc-100 dark:bg-zinc-800' : ''}`}>
+              <div className="font-medium truncate">{n.title || "Untitled"}</div>
+              <div className="text-xs opacity-60 truncate">{n.tags?.map(t=>`#${t}`).join(' ')}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="col-span-9 grid grid-cols-2">
+        <div className="border-r p-3 flex flex-col">
+          <div className="flex items-center gap-2 mb-2">
+            <input className="w-full px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800" placeholder="Note title" value={title} onChange={e=>setTitle(e.target.value)} />
+            {selected && (
+              <>
+                <button onClick={saveNote} className="px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800 flex items-center gap-2"><Save className="w-4 h-4"/>Save</button>
+                <button onClick={()=>delNote(selected)} className="px-3 py-2 rounded-xl bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300 flex items-center gap-2"><X className="w-4 h-4"/>Delete</button>
+              </>
+            )}
+          </div>
+          <textarea className="flex-1 w-full rounded-xl p-3 bg-zinc-50 dark:bg-zinc-900 border" placeholder="Write in Markdown. Use #tags and [[Backlinks]]. Select text and click 'Make Card' to add to flashcards." value={raw} onChange={e=>setRaw(e.target.value)} />
+          <div className="flex justify-between mt-2 text-xs opacity-60">
+            <div>Tags: {tagify(raw).map(t=>`#${t}`).join(' ')}</div>
+            <div className="flex gap-2">
+              <button onClick={makeCardFromSelection} className="px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800"><Sparkles className="w-3 h-3 inline mr-1"/>Make Card</button>
+            </div>
+          </div>
+        </div>
+        <div className="p-3 overflow-y-auto">
+          <div className="font-medium mb-2">Preview</div>
+          <div className="prose dark:prose-invert max-w-none" dangerouslySetInnerHTML={{ __html: preview }} />
+          {selected && (
+            <div className="mt-6">
+              <div className="text-sm uppercase tracking-widest opacity-60 mb-2">Backlinks</div>
+              <div className="flex flex-col gap-2">
+                {backlinksFor(state.notes.find(n=>n.id===selected)).map(b=> (
+                  <button key={b.id} onClick={()=>openNote(b)} className="text-left p-2 rounded-xl bg-zinc-50 dark:bg-zinc-900 border">
+                    <div className="font-medium">{b.title}</div>
+                    <div className="text-xs opacity-60 truncate">mentions this note</div>
+                  </button>
+                ))}
+                {backlinksFor(state.notes.find(n=>n.id===selected)).length===0 && <div className="text-sm opacity-60">No backlinks yet.</div>}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Tasks({ state, setState, query }) {
+  const statuses = [
+    { id:"todo", label:"To Do" },
+    { id:"doing", label:"Doing" },
+    { id:"done", label:"Done" }
+  ];
+
+  function addTask(){
+    const title = prompt("Task title?");
+    if(!title) return;
+    const t = { id: uuidv4(), title, status: "todo", priority: 2, createdAt: nowISO() };
+    setState(s=>({ ...s, tasks:[t, ...s.tasks], activity:[...s.activity, {type:'task', ts:nowISO()}] }));
+  }
+
+  function moveTask(id, status){
+    setState(s=>({ ...s, tasks: s.tasks.map(t=>t.id===id? { ...t, status } : t) }));
+  }
+
+  function delTask(id){
+    setState(s=>({ ...s, tasks: s.tasks.filter(t=>t.id!==id) }));
+  }
+
+  const filtered = useMemo(()=>{
+    const q = query.toLowerCase();
+    return state.tasks.filter(t=>!q || t.title.toLowerCase().includes(q));
+  }, [state.tasks, query]);
+
+  return (
+    <div className="p-4 h-[calc(100vh-64px)] overflow-hidden">
+      <div className="flex items-center justify-between mb-3">
+        <div className="font-medium">Kanban</div>
+        <button onClick={addTask} className="px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800 flex items-center gap-2"><Plus className="w-4 h-4"/>Add Task</button>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 h-[calc(100%-40px)]">
+        {statuses.map(col => (
+          <div key={col.id} className="rounded-2xl border bg-white/50 dark:bg-zinc-900/50 p-3 flex flex-col">
+            <div className="font-medium mb-2">{col.label}</div>
+            <div className="flex-1 overflow-y-auto flex flex-col gap-3">
+              {filtered.filter(t=>t.status===col.id).map(t => (
+                <div key={t.id} className="p-3 rounded-xl bg-zinc-50 dark:bg-zinc-900 border">
+                  <div className="font-medium">{t.title}</div>
+                  <div className="text-xs opacity-60 mb-2">Created {formatDate(t.createdAt)}</div>
+                  <div className="flex gap-2">
+                    {statuses.filter(s=>s.id!==t.status).map(s => (
+                      <button key={s.id} onClick={()=>moveTask(t.id, s.id)} className="px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800">Move to {s.label}</button>
+                    ))}
+                    <button onClick={()=>delTask(t.id)} className="ml-auto px-2 py-1 rounded-lg bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300">Delete</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Flashcards({ state, setState, query }) {
+  const [deckId, setDeckId] = useState(state.decks[0]?.id || null);
+  useEffect(()=>{ if(!deckId && state.decks[0]) setDeckId(state.decks[0].id); }, [state.decks, deckId]);
+
+  function addDeck(){
+    const name = prompt("Deck name?");
+    if(!name) return;
+    const d = { id: uuidv4(), name, cards: [] };
+    setState(s=>({ ...s, decks:[...s.decks, d] }));
+  }
+
+  function addCard(){
+    const front = prompt("Front?");
+    if(!front) return;
+    const back = prompt("Back?") || "";
+    const c = { id: uuidv4(), front, back, ease: 2.5, interval: 0, reps: 0, due: nowISO(), createdAt: nowISO(), updatedAt: nowISO() };
+    setState(s=>({ ...s, decks: s.decks.map(d=>d.id===deckId? { ...d, cards:[c, ...d.cards] } : d) }));
+  }
+
+  function review(quality){
+    // quality: 0 Again, 1 Hard, 2 Good, 3 Easy
+    const d = state.decks.find(d=>d.id===deckId);
+    const dueCards = d?.cards.filter(c=>new Date(c.due)<=new Date())||[];
+    if (dueCards.length===0) return;
+    const first = dueCards[0];
+    const updated = scheduleCard(first, quality);
+    setState(s=>({
+      ...s,
+      decks: s.decks.map(x=>x.id===deckId? { ...x, cards: x.cards.map(c=>c.id===first.id? updated : c) } : x),
+      activity: [...s.activity, { type:'review', ts: nowISO() }]
+    }));
+  }
+
+  const deck = state.decks.find(d=>d.id===deckId);
+  const visibleCards = (deck?.cards || []).filter(c=>!query || c.front.toLowerCase().includes(query.toLowerCase()));
+  const dueCount = deck ? deck.cards.filter(c=>new Date(c.due)<=new Date()).length : 0;
+  const next = deck ? deck.cards.filter(c=>new Date(c.due)<=new Date())[0] : null;
+
+  return (
+    <div className="p-4 grid grid-cols-1 lg:grid-cols-3 gap-4 h-[calc(100vh-64px)]">
+      <div className="rounded-2xl border bg-white/50 dark:bg-zinc-900/50 p-3">
+        <div className="flex items-center gap-2 mb-3">
+          <select value={deckId||''} onChange={e=>setDeckId(e.target.value)} className="px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800 flex-1">
+            {state.decks.map(d=>(<option key={d.id} value={d.id}>{d.name}</option>))}
+          </select>
+          <button onClick={addDeck} className="px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800 flex items-center gap-2"><Plus className="w-4 h-4"/>Deck</button>
+          <button onClick={addCard} className="px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800 flex items-center gap-2"><FileText className="w-4 h-4"/>Card</button>
+        </div>
+        <div className="text-sm opacity-70">Cards due: {dueCount}</div>
+        <div className="mt-3 p-3 rounded-xl bg-zinc-50 dark:bg-zinc-900 border min-h-[160px]">
+          {next ? (
+            <>
+              <div className="font-medium mb-2">{next.front}</div>
+              <details>
+                <summary className="cursor-pointer text-sm opacity-70">Show answer</summary>
+                <div className="mt-2">{next.back}</div>
+              </details>
+              <div className="flex gap-2 mt-3">
+                <button onClick={()=>review(0)} className="px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800">Again</button>
+                <button onClick={()=>review(1)} className="px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800">Hard</button>
+                <button onClick={()=>review(2)} className="px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800">Good</button>
+                <button onClick={()=>review(3)} className="px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800">Easy</button>
+              </div>
+            </>
+          ) : (
+            <div className="opacity-60">No cards due. Add or wait until due.</div>
+          )}
+        </div>
+      </div>
+      <div className="lg:col-span-2 rounded-2xl border bg-white/50 dark:bg-zinc-900/50 p-3 overflow-y-auto">
+        <div className="font-medium mb-2">Deck Cards</div>
+        <div className="grid md:grid-cols-2 gap-3">
+          {visibleCards.map(c => (
+            <div key={c.id} className="p-3 rounded-xl bg-zinc-50 dark:bg-zinc-900 border">
+              <div className="font-medium">{c.front}</div>
+              <div className="text-sm opacity-80">{c.back}</div>
+              <div className="text-xs opacity-60 mt-1">Due {formatDate(c.due)} | Ease {c.ease.toFixed(2)} | Interval {c.interval}d</div>
+            </div>
+          ))}
+          {visibleCards.length===0 && <div className="opacity-60">No cards match.</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DataExplorer({ state, setState, query }) {
+  const [selectedId, setSelectedId] = useState(null);
+  const [xKey, setXKey] = useState("");
+  const [yKey, setYKey] = useState("");
+  const [chartType, setChartType] = useState("line");
+
+  function addDataset(rows, name) {
+    const columns = rows.length ? Object.keys(rows[0]) : [];
+    const ds = { id: uuidv4(), name: name || `Dataset ${state.datasets.length+1}`, rows, columns, createdAt: nowISO() };
+    setState(s=>({ ...s, datasets:[ds, ...s.datasets], activity:[...s.activity, {type:'data', ts:nowISO()}] }));
+    setSelectedId(ds.id); setXKey(columns[0]||""); setYKey(columns[1]||"");
+  }
+
+  function onUpload(e){
+    const file = e.target.files?.[0]; if(!file) return;
+    Papa.parse(file, { header: true, dynamicTyping: true, complete: (res)=>{
+      addDataset(res.data.filter(r=>Object.values(r).some(v=>v!==null && v!=="")), file.name);
+    }});
+  }
+
+  const ds = state.datasets.find(d=>d.id===selectedId) || state.datasets[0];
+  useEffect(()=>{
+    if (state.datasets.length && !selectedId) setSelectedId(state.datasets[0].id);
+  }, [state.datasets, selectedId]);
+
+  const viewRows = useMemo(()=>{
+    if(!ds) return [];
+    if(!query) return ds.rows.slice(0, 200);
+    const q = query.toLowerCase();
+    return ds.rows.filter(r=>Object.values(r).some(v=>String(v).toLowerCase().includes(q))).slice(0, 200);
+  }, [ds, query]);
+
+  const chartData = useMemo(()=>{
+    if (!ds || !xKey || !yKey) return [];
+    return ds.rows.map(r=>({ x:r[xKey], y: Number(r[yKey]) })).filter(p=>!Number.isNaN(p.y));
+  }, [ds, xKey, yKey]);
+
+  return (
+    <div className="p-4 grid grid-cols-1 lg:grid-cols-3 gap-4 h-[calc(100vh-64px)]">
+      <div className="rounded-2xl border bg-white/50 dark:bg-zinc-900/50 p-3">
+        <div className="font-medium mb-2">Datasets</div>
+        <div className="flex items-center gap-2 mb-2">
+          <input type="file" accept=".csv" onChange={onUpload} className="px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800 w-full"/>
+        </div>
+        <div className="flex flex-col gap-2 max-h-72 overflow-y-auto">
+          {state.datasets.map(d => (
+            <button key={d.id} onClick={()=>{setSelectedId(d.id); setXKey(d.columns[0]||""); setYKey(d.columns[1]||"");}} className={`text-left p-2 rounded-xl hover:bg-zinc-100 dark:hover:bg-zinc-800 ${ds?.id===d.id? 'bg-zinc-100 dark:bg-zinc-800' : ''}`}>
+              <div className="font-medium truncate">{d.name}</div>
+              <div className="text-xs opacity-60">{d.columns.length} cols • {d.rows.length} rows</div>
+            </button>
+          ))}
+          {state.datasets.length===0 && <div className="opacity-60">Upload a CSV to begin.</div>}
+        </div>
+      </div>
+      <div className="lg:col-span-2 rounded-2xl border bg-white/50 dark:bg-zinc-900/50 p-3 flex flex-col">
+        {ds ? (
+          <>
+            <div className="flex items-center gap-2 mb-3">
+              <select value={xKey} onChange={e=>setXKey(e.target.value)} className="px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800">
+                <option value="">X</option>
+                {ds.columns.map(c=>(<option key={c} value={c}>{c}</option>))}
+              </select>
+              <select value={yKey} onChange={e=>setYKey(e.target.value)} className="px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800">
+                <option value="">Y</option>
+                {ds.columns.map(c=>(<option key={c} value={c}>{c}</option>))}
+              </select>
+              <select value={chartType} onChange={e=>setChartType(e.target.value)} className="px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800">
+                <option value="line">Line</option>
+                <option value="bar">Bar</option>
+                <option value="pie">Pie (uses Y only)</option>
+              </select>
+            </div>
+            <div className="h-64">
+              <ResponsiveContainer width="100%" height="100%">
+                {chartType==="line" && (
+                  <LineChart data={chartData}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="x" />
+                    <YAxis />
+                    <ReTooltip />
+                    <Line type="monotone" dataKey="y" />
+                  </LineChart>
+                )}
+                {chartType==="bar" && (
+                  <BarChart data={chartData}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="x" />
+                    <YAxis />
+                    <ReTooltip />
+                    <Bar dataKey="y" />
+                  </BarChart>
+                )}
+                {chartType==="pie" && (
+                  <PieChart>
+                    <ReTooltip />
+                    <Pie data={chartData} dataKey="y" nameKey="x" cx="50%" cy="50%" outerRadius={80} />
+                  </PieChart>
+                )}
+              </ResponsiveContainer>
+            </div>
+            <div className="mt-4 overflow-auto border rounded-xl">
+              <table className="min-w-full text-sm">
+                <thead className="bg-zinc-50 dark:bg-zinc-900">
+                  <tr>{ds.columns.map(c=> (<th key={c} className="text-left p-2 border-b">{c}</th>))}</tr>
+                </thead>
+                <tbody>
+                  {viewRows.map((r,i)=> (
+                    <tr key={i} className="odd:bg-white even:bg-zinc-50 dark:odd:bg-zinc-900 dark:even:bg-zinc-950">
+                      {ds.columns.map(c=> (<td key={c} className="p-2 border-b">{String(r[c])}</td>))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        ) : (
+          <div className="opacity-60">No dataset selected.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Graph({ state, setActive }) {
+  const ref = useRef(null);
+  useEffect(()=>{
+    const notes = state.notes;
+    const nodes = notes.map(n=>({ id:n.id, title:n.title }));
+    const links = [];
+    const idByTitle = new Map(notes.map(n=>[n.title, n.id]));
+    for (const n of notes) {
+      const back = extractLinks(n.content);
+      for (const t of back) {
+        const targetId = idByTitle.get(t);
+        if (targetId) links.push({ source:n.id, target:targetId });
+      }
+    }
+    const width = ref.current.clientWidth;
+    const height = ref.current.clientHeight;
+    const svg = d3.select(ref.current).append("svg").attr("width", width).attr("height", height);
+    const sim = d3.forceSimulation(nodes)
+      .force("charge", d3.forceManyBody().strength(-120))
+      .force("center", d3.forceCenter(width/2, height/2))
+      .force("link", d3.forceLink(links).id(d=>d.id).distance(120));
+
+    const link = svg.append("g").attr("stroke", "currentColor").attr("stroke-opacity", 0.3)
+      .selectAll("line").data(links).enter().append("line");
+
+    const node = svg.append("g").selectAll("g").data(nodes).enter().append("g").style("cursor","pointer").on("click", (_,d)=>{
+      // Jump to notes tab when clicked
+      setActive("notes");
+      // store a hint in localStorage to open that note
+      localStorage.setItem("scholaros.openNoteId", d.id);
+    });
+
+    node.append("circle").attr("r", 10).attr("fill", "currentColor");
+    node.append("text").text(d=>d.title).attr("x", 14).attr("y", 4).attr("class","text-sm");
+
+    sim.on("tick", ()=>{
+      link.attr("x1", d=>d.source.x).attr("y1", d=>d.source.y).attr("x2", d=>d.target.x).attr("y2", d=>d.target.y);
+      node.attr("transform", d=>`translate(${d.x},${d.y})`);
+    });
+
+    return ()=>{ svg.remove(); sim.stop(); };
+  }, [state.notes]);
+
+  return <div ref={ref} className="p-4 h-[calc(100vh-64px)]" />;
+}
+
+function About() {
+  return (
+    <div className="p-6 max-w-3xl">
+      <div className="prose dark:prose-invert">
+        <h1>About Scholar OS</h1>
+        <p>
+          This is a fully client‑side research workspace: capture ideas, build backlinks, manage tasks, practice flashcards, and explore datasets with charts. Everything lives in your browser’s storage — no servers, no logins.
+        </p>
+        <h3>Tips</h3>
+        <ul>
+          <li>Use <code>[[Linked Notes]]</code> to connect ideas. Open the Graph to visualize.</li>
+          <li>Select text in a note and click <em>Make Card</em> to create flashcards.</li>
+          <li>Import/Export from the top bar to move data between browsers.</li>
+        </ul>
+        <p>Made for ambitious learners. Have fun! ✨</p>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Main App ----------
+export default function App(){
+  const [state, setState] = useLocalState("scholaros.state", starter);
+  const [active, setActive] = useLocalState("scholaros.active", "dashboard");
+  const [query, setQuery] = useState("");
+
+  // Handle import/export
+  function onExport(){ download(`scholar-os-${new Date().toISOString().slice(0,10)}.json`, JSON.stringify(state, null, 2)); }
+  function onImport(e){
+    const file = e.target.files?.[0]; if(!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try { const data = JSON.parse(reader.result); setState(data); alert("Imported!"); }
+      catch { alert("Import failed: invalid JSON"); }
+    };
+    reader.readAsText(file);
+  }
+
+  // When graph node clicks request a specific note
+  useEffect(()=>{
+    const openId = localStorage.getItem("scholaros.openNoteId");
+    if (openId) {
+      // we just flip to notes; the Notes component will open from click handler
+      setActive("notes");
+      // remove hint
+      localStorage.removeItem("scholaros.openNoteId");
+    }
+  }, [active]);
+
+  function onMakeCardFromSelection(text){
+    // Create in first deck (or make one)
+    setState(s=>{
+      const decks = s.decks.length ? s.decks : [{ id: uuidv4(), name: "Quick Captures", cards: [] }];
+      const deckId = decks[0].id;
+      const c = { id: uuidv4(), front: text, back: "(fill in)", ease: 2.5, interval: 0, reps: 0, due: nowISO(), createdAt: nowISO(), updatedAt: nowISO() };
+      const newDecks = decks.map(d=>d.id===deckId? { ...d, cards:[c, ...d.cards] } : d);
+      return { ...s, decks: newDecks, activity:[...s.activity, {type:'review', ts:nowISO()}] };
+    });
+    setActive("flash");
+  }
+
+  return (
+    <div className="h-screen w-full bg-gradient-to-b from-white to-zinc-50 dark:from-zinc-950 dark:to-black text-zinc-900 dark:text-zinc-100">
+      <TopBar query={query} setQuery={setQuery} onExport={onExport} onImport={onImport} />
+      <div className="grid grid-cols-12 h-[calc(100vh-64px)]">
+        <div className="col-span-3 md:col-span-2 lg:col-span-2">
+          <Sidebar active={active} setActive={setActive} />
+        </div>
+        <div className="col-span-9 md:col-span-10 lg:col-span-10 overflow-hidden">
+          {active==="dashboard" && <Dashboard state={state} />}
+          {active==="notes" && <Notes state={state} setState={setState} query={query} onMakeCard={onMakeCardFromSelection} />}
+          {active==="tasks" && <Tasks state={state} setState={setState} query={query} />}
+          {active==="flash" && <Flashcards state={state} setState={setState} query={query} />}
+          {active==="data" && <DataExplorer state={state} setState={setState} query={query} />}
+          {active==="graph" && <Graph state={state} setActive={setActive} />}
+          {active==="about" && <About />}
+        </div>
+      </div>
+    </div>
+  );
+}
